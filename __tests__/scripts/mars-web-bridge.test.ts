@@ -7,7 +7,7 @@ import {
 } from "node:http";
 import { mkdtempSync } from "node:fs";
 import net from "node:net";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   afterAll,
@@ -37,13 +37,12 @@ import {
   rewriteAgentServerUrls,
 } from "../../scripts/mars-web-bridge.mjs";
 
-const SESSION_ID = "sess_a";
-
-// The proxy (httpxy) streams a request body once its upstream socket
-// connects, which MSW's interceptor never signals for a request it bypasses.
-// Everything here talks to real loopback servers, so take MSW out of the way.
+// Lets a test take the home folder away; every other call is the real one.
+// A fixed set of network addresses for pairing links, and a home folder a
+// test can take away.
 vi.mock("node:os", async (importOriginal) => {
   const os = await importOriginal<typeof import("node:os")>();
+  const homedir = vi.fn(os.homedir);
   const networkInterfaces = () => ({
     lo: [{ family: "IPv4", internal: true, address: "127.0.0.1" }],
     docker0: [{ family: "IPv4", internal: false, address: "172.17.0.1" }],
@@ -53,9 +52,19 @@ vi.mock("node:os", async (importOriginal) => {
       { family: "IPv4", internal: false, address: "192.168.1.20" },
     ],
   });
-  return { ...os, default: { ...os, networkInterfaces }, networkInterfaces };
+  return {
+    ...os,
+    default: { ...os, homedir, networkInterfaces },
+    homedir,
+    networkInterfaces,
+  };
 });
 
+const SESSION_ID = "sess_a";
+
+// The proxy (httpxy) streams a request body once its upstream socket
+// connects, which MSW's interceptor never signals for a request it bypasses.
+// Everything here talks to real loopback servers, so take MSW out of the way.
 beforeAll(() => mswServer.close());
 afterAll(() => mswServer.listen({ onUnhandledRequest: "bypass" }));
 
@@ -808,7 +817,7 @@ describe("createMarsWebBridge with a session key", () => {
 
     ws.send(JSON.stringify({ type: "auth", session_api_key: "wrong" }));
 
-    expect(await closed).toBe(1008);
+    expect(await closed).toBe(4001);
     expect(upstream.seen.ws).toHaveLength(0);
   });
 });
@@ -836,7 +845,7 @@ describe("createMarsWebBridge first-message login window", () => {
       ws.on("close", (closeCode) => resolve(closeCode)),
     );
 
-    expect(code).toBe(1008);
+    expect(code).toBe(4001);
     expect(upstream.seen.ws).toHaveLength(0);
     await marsWeb.dispose();
     web.close();
@@ -861,6 +870,28 @@ describe("mountMarsWebBridge", () => {
     expect(warnings).toEqual([]);
     expect(debugs[0]).toMatch(/local callers only/);
     await mounted!.dispose();
+  });
+
+  it("still starts without a home folder, keeping sign-ins off disk", async () => {
+    // HOME unset and no passwd entry, as with `docker run --user <uid>`.
+    const realHomedir = vi.mocked(homedir).getMockImplementation()!;
+    vi.mocked(homedir).mockImplementation(() => {
+      throw new Error("uv_os_homedir returned ENOENT");
+    });
+    try {
+      const mounted = mountMarsWebBridge({
+        env: {},
+        host: "127.0.0.1",
+        log: () => {},
+        debug: () => {},
+      });
+
+      expect(mounted).not.toBeNull();
+      expect(mounted!.bridge.getAuthState().storage.kind).not.toBe("file");
+      await mounted!.dispose();
+    } finally {
+      vi.mocked(homedir).mockImplementation(realHomedir);
+    }
   });
 
   it("is off with MARS_WEB=0 and its synonyms, silently", () => {
@@ -1175,7 +1206,7 @@ describe("createMarsWebBridge sign-in with DigitalOcean", () => {
 describe("createMarsWebBridge pairing a new device", () => {
   const KEY = "canvas-key";
 
-  async function start(host: string) {
+  async function start(host: string, basePath?: string) {
     const marsWeb = createMarsWebBridge({
       bridge: {
         getTunnel: () => undefined,
@@ -1184,6 +1215,7 @@ describe("createMarsWebBridge pairing a new device", () => {
       env: {},
       host,
       key: KEY,
+      basePath,
       log: () => {},
     });
     const web = await startWebServer(marsWeb);
@@ -1246,6 +1278,16 @@ describe("createMarsWebBridge pairing a new device", () => {
     expect(first.headers.get("set-cookie")).toMatch(/^mars_web_auth=/);
     expect(again.status).toBe(400);
     expect((await redeem(web.origin, "guessed")).status).toBe(400);
+    await close();
+  });
+
+  it("opens the page under the base path Canvas is mounted at", async () => {
+    const { web, close } = await start("0.0.0.0", "/canvas");
+    const port = new URL(web.origin).port;
+
+    const { links } = await createLinkFrom(web.origin, `192.168.1.20:${port}`);
+
+    expect(new URL(links[0]).pathname).toBe("/canvas/pair");
     await close();
   });
 

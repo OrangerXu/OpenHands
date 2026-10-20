@@ -76,7 +76,7 @@ export const MARS_WEB_PREFIX = "/mars";
 const HEALTH_PATH = `${MARS_WEB_PREFIX}/health`;
 /** Where a new device redeems a pairing link; needs no key, only the link. */
 const PAIR_PATH = `${MARS_WEB_PREFIX}/pair`;
-/** The page a pairing link opens; the secret rides in its fragment. */
+/** The page a pairing link opens, under the base path; the secret rides in its fragment. */
 const PAIR_PAGE_PATH = "/pair";
 const PAIRING_TTL_MS = 5 * 60 * 1000;
 const PAIR_BODY_LIMIT_BYTES = 4 * 1024;
@@ -96,7 +96,8 @@ const AUTH_COOKIE = "mars_web_auth";
  * the Agent Server itself takes it. Nothing reaches the session before that.
  */
 const FIRST_MESSAGE_AUTH_TIMEOUT_MS = 10_000;
-const CLOSE_POLICY = 1008;
+/** What the Agent Server closes a socket with when its key is wrong. */
+const CLOSE_AUTH_FAILED = 4001;
 const CLOSE_UNREACHABLE = 1011;
 /** Close codes a peer may not send itself; relayed as their nearest cousin. */
 const RESERVED_CLOSE_CODES = new Map([
@@ -173,7 +174,14 @@ export function resolveMarsWebKey({
 export function resolveMarsStateDir(env = process.env) {
   const configured =
     env.MARS_STATE_DIR?.trim() || env.OH_CANVAS_SAFE_STATE_DIR?.trim();
-  return configured || path.join(homedir(), ".openhands", "agent-canvas");
+  if (configured) return configured;
+  try {
+    return path.join(homedir(), ".openhands", "agent-canvas");
+  } catch {
+    // No home folder (HOME unset and no passwd entry, as with `docker run
+    // --user <uid>`): sign-ins stay in memory rather than Canvas not starting.
+    return null;
+  }
 }
 
 /**
@@ -206,6 +214,7 @@ export function mountMarsWebBridge({
   env = process.env,
   host = DEFAULT_BIND_HOST,
   sessionApiKey = null,
+  basePath = "",
   log = (message) => console.warn(`[mars-web] ${message}`),
   debug = (message) => console.debug(`[mars-web] ${message}`),
 } = {}) {
@@ -223,6 +232,7 @@ export function mountMarsWebBridge({
     env,
     host,
     key,
+    basePath,
     stateDir: resolveMarsStateDir(env),
   });
 }
@@ -488,6 +498,7 @@ function toUpstreamRequest(req, path) {
  * @param {Record<string, string | undefined>} [options.env]
  * @param {string} [options.host] The server's bind host; loopback gets the Host check
  * @param {string | null} [options.key] Session key every request must present; null = open (loopback dev only — see mountMarsWebBridge)
+ * @param {string} [options.basePath] Where the app is mounted (`/canvas` in Docker); pairing links open a page under it
  * @param {string | null} [options.stateDir] Canvas state directory; null keeps credentials in memory
  * @param {number} [options.authTimeoutMs] How long a socket may take to send the key
  * @param {(message: string, error?: unknown) => void} [options.log]
@@ -497,10 +508,12 @@ export function createMarsWebBridge({
   env = process.env,
   host = DEFAULT_BIND_HOST,
   key = null,
+  basePath = "",
   stateDir = null,
   authTimeoutMs = FIRST_MESSAGE_AUTH_TIMEOUT_MS,
   log = (message, error) => console.warn(`[mars-web] ${message}`, error ?? ""),
 } = {}) {
+  const pairPage = `${String(basePath).replace(/\/+$/, "")}${PAIR_PAGE_PATH}`;
   const dir = stateDir ? path.join(stateDir, STATE_SUBDIR) : null;
   const bridge =
     bridgeOverride ??
@@ -599,7 +612,7 @@ export function createMarsWebBridge({
       pairings.set(hashSecret(secret), expiresAt);
       return {
         links: pairingOrigins(req, host).map(
-          (origin) => `${origin}${PAIR_PAGE_PATH}#${secret}`,
+          (origin) => `${origin}${pairPage}#${secret}`,
         ),
         expiresAt: new Date(expiresAt).toISOString(),
       };
@@ -756,13 +769,13 @@ export function createMarsWebBridge({
     firstMessageAuth.handleUpgrade(req, socket, head, (client) => {
       client.on("error", () => {});
       const timer = setTimeout(
-        () => client.close(CLOSE_POLICY, "session key required"),
+        () => client.close(CLOSE_AUTH_FAILED, "Authentication failed"),
         authTimeoutMs,
       );
       client.once("message", (data, isBinary) => {
         clearTimeout(timer);
         if (isBinary || !isAuthFrame(data.toString("utf8"), key)) {
-          client.close(CLOSE_POLICY, "session key required");
+          client.close(CLOSE_AUTH_FAILED, "Authentication failed");
           return;
         }
         relayWebSocket(client, session);
