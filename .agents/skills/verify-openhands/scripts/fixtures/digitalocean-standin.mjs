@@ -293,7 +293,21 @@ export function createStandin({ guestUrl, wakeMs = 2000, record = () => {} }) {
     });
   });
 
-  return { server, state };
+  /**
+   * Ends every tunnel (its close handler destroys the upstream), then the
+   * server. A tunnel is an upgraded socket: closeAllConnections() does not see
+   * it, and server.close() would wait for it.
+   */
+  const close = () => {
+    for (const ws of sockets.clients) ws.terminate();
+    server.closeAllConnections();
+    return Promise.all([
+      new Promise((resolve) => sockets.close(resolve)),
+      new Promise((resolve) => server.close(resolve)),
+    ]);
+  };
+
+  return { server, state, close };
 }
 
 // --- CLI: run wiring, the sandbox, the time limit -------------------------
@@ -418,7 +432,7 @@ async function main() {
   const guest = options["guest-url"]
     ? { url: options["guest-url"], child: null }
     : await startGuest(options.run, dir, launcherEnv);
-  const { server } = createStandin({
+  const { server, close } = createStandin({
     guestUrl: guest.url,
     wakeMs: options.wakeMs,
     record: (entry) =>
@@ -459,8 +473,9 @@ async function main() {
       ...metadata,
       stoppedAt: new Date().toISOString(),
     });
-    server.closeAllConnections();
-    server.close(() => process.exit(0));
+    // Bounded, so a client that keeps a socket open cannot keep us running.
+    await Promise.race([close(), sleep(1000)]);
+    process.exit(0);
   };
   process.on("SIGTERM", stop);
   process.on("SIGINT", stop);

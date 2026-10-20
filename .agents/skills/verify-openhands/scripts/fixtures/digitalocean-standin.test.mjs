@@ -53,16 +53,13 @@ async function startGuest() {
 
 async function start({ wakeMs = 20 } = {}) {
   const calls = [];
-  const { server } = createStandin({
+  const { server, close } = createStandin({
     guestUrl: await startGuest(),
     wakeMs,
     record: (entry) => calls.push(entry),
   });
   const port = await listen(server);
-  cleanups.push(() => {
-    server.closeAllConnections();
-    return new Promise((resolve) => server.close(resolve));
-  });
+  cleanups.push(close);
   const base = `http://127.0.0.1:${port}`;
   const call = async (method, path, body, headers = AUTH) => {
     const response = await fetch(`${base}${path}`, {
@@ -240,4 +237,51 @@ test("points the run at itself while it runs, and puts the run back when stopped
   assert.equal(env.MARS_API_BASE_URL, undefined);
   assert.equal(env.KEEP, "me");
   assert.ok(JSON.parse(readFileSync(metadata, "utf8")).stoppedAt);
+});
+
+test("stops on SIGTERM while a tunnel is open", async () => {
+  const run = mkdtempSync(join(tmpdir(), "oh-do-standin-"));
+  mkdirSync(join(run, "private"));
+  const envFile = join(run, "private", "launcher-env.json");
+  writeFileSync(envFile, JSON.stringify({ PATH: process.env.PATH }));
+  const child = spawn(
+    process.execPath,
+    [
+      FIXTURE,
+      "--run",
+      run,
+      "--guest-url",
+      await startGuest(),
+      "--seconds",
+      "60",
+    ],
+    { stdio: ["ignore", "pipe", "inherit"] },
+  );
+  cleanups.push(() => child.exitCode === null && child.kill("SIGKILL"));
+  const ready = await new Promise((resolve) => {
+    child.stdout.once("data", (chunk) => resolve(JSON.parse(String(chunk))));
+  });
+  const ws = new WebSocket(
+    `${ready.baseUrl.replace("http", "ws")}/v2/agents/sessions/sess_ready/port-forward/8000`,
+    { headers: AUTH },
+  );
+  cleanups.push(() => ws.terminate());
+  await new Promise((resolve, reject) => {
+    ws.once("open", resolve);
+    ws.on("error", reject);
+  });
+
+  child.kill("SIGTERM");
+  const exited = await new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(false), 5000);
+    child.once("exit", () => {
+      clearTimeout(timer);
+      resolve(true);
+    });
+  });
+  assert.ok(exited, "the stand-in is still running 5 s after SIGTERM");
+  assert.equal(
+    JSON.parse(readFileSync(envFile, "utf8")).MARS_API_BASE_URL,
+    undefined,
+  );
 });
