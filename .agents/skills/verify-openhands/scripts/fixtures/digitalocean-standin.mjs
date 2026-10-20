@@ -262,6 +262,9 @@ export function createStandin({ guestUrl, wakeMs = 2000, record = () => {} }) {
     if (!m || !authorized(req)) {
       const status = m ? 401 : 404;
       tunnel(status);
+      // Node drops its own error listener when it hands over an upgrade, so a
+      // client that resets before this reply would otherwise take us down.
+      socket.on("error", () => socket.destroy());
       socket.end(
         `HTTP/1.1 ${status} ${m ? "Unauthorized" : "Not Found"}\r\n` +
           "Content-Type: application/json\r\nConnection: close\r\n\r\n" +
@@ -270,6 +273,11 @@ export function createStandin({ guestUrl, wakeMs = 2000, record = () => {} }) {
       return;
     }
     sockets.handleUpgrade(req, socket, head, (ws) => {
+      // A bad frame from the client: ws already closes the tunnel (1002 and
+      // the like), and the close handler below destroys the upstream.
+      ws.on("error", (error) =>
+        tunnel("error", { error: error.code ?? error.message }),
+      );
       const session = sessionById(m[1]);
       if (session?.status !== READY) {
         tunnel(CLOSE_SESSION_UNAVAILABLE, { session: session?.status ?? null });

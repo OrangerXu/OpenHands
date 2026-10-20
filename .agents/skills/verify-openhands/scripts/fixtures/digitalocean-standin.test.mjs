@@ -9,6 +9,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { createServer } from "node:http";
+import { connect } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -196,13 +197,14 @@ test("tunnels a ready session's guest port to the sandbox, and refuses the rest"
   );
 });
 
-test("points the run at itself while it runs, and puts the run back when stopped", async () => {
+/** Runs the CLI against a fresh run directory; resolves once it is listening. */
+async function startCli(launcherEnv = {}) {
   const run = mkdtempSync(join(tmpdir(), "oh-do-standin-"));
   mkdirSync(join(run, "private"));
   const envFile = join(run, "private", "launcher-env.json");
   writeFileSync(
     envFile,
-    JSON.stringify({ PATH: process.env.PATH, KEEP: "me" }),
+    JSON.stringify({ PATH: process.env.PATH, ...launcherEnv }),
   );
   const child = spawn(
     process.execPath,
@@ -221,6 +223,36 @@ test("points the run at itself while it runs, and puts the run back when stopped
   const ready = await new Promise((resolve) => {
     child.stdout.once("data", (chunk) => resolve(JSON.parse(String(chunk))));
   });
+  return { run, envFile, child, ready };
+}
+
+/** SIGTERMs the CLI; resolves with its exit code, or null after 5 s. */
+function stopCli(child) {
+  child.kill("SIGTERM");
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(null), 5000);
+    child.once("exit", (code) => {
+      clearTimeout(timer);
+      resolve(code);
+    });
+  });
+}
+
+const openTunnel = async (baseUrl) => {
+  const ws = new WebSocket(
+    `${baseUrl.replace("http", "ws")}/v2/agents/sessions/sess_ready/port-forward/8000`,
+    { headers: AUTH },
+  );
+  cleanups.push(() => ws.terminate());
+  await new Promise((resolve, reject) => {
+    ws.once("open", resolve);
+    ws.on("error", reject);
+  });
+  return ws;
+};
+
+test("points the run at itself while it runs, and puts the run back when stopped", async () => {
+  const { run, envFile, child, ready } = await startCli({ KEEP: "me" });
 
   assert.equal(ready.ok, true);
   assert.equal(
@@ -231,8 +263,7 @@ test("points the run at itself while it runs, and puts the run back when stopped
   assert.equal(statSync(metadata).mode & 0o777, 0o600);
   assert.equal((await fetch(`${ready.baseUrl}/__standin/state`)).status, 200);
 
-  child.kill("SIGTERM");
-  await new Promise((resolve) => child.once("exit", resolve));
+  assert.equal(await stopCli(child), 0);
   const env = JSON.parse(readFileSync(envFile, "utf8"));
   assert.equal(env.MARS_API_BASE_URL, undefined);
   assert.equal(env.KEEP, "me");
@@ -240,48 +271,72 @@ test("points the run at itself while it runs, and puts the run back when stopped
 });
 
 test("stops on SIGTERM while a tunnel is open", async () => {
-  const run = mkdtempSync(join(tmpdir(), "oh-do-standin-"));
-  mkdirSync(join(run, "private"));
-  const envFile = join(run, "private", "launcher-env.json");
-  writeFileSync(envFile, JSON.stringify({ PATH: process.env.PATH }));
-  const child = spawn(
-    process.execPath,
-    [
-      FIXTURE,
-      "--run",
-      run,
-      "--guest-url",
-      await startGuest(),
-      "--seconds",
-      "60",
-    ],
-    { stdio: ["ignore", "pipe", "inherit"] },
-  );
-  cleanups.push(() => child.exitCode === null && child.kill("SIGKILL"));
-  const ready = await new Promise((resolve) => {
-    child.stdout.once("data", (chunk) => resolve(JSON.parse(String(chunk))));
-  });
-  const ws = new WebSocket(
-    `${ready.baseUrl.replace("http", "ws")}/v2/agents/sessions/sess_ready/port-forward/8000`,
-    { headers: AUTH },
-  );
-  cleanups.push(() => ws.terminate());
-  await new Promise((resolve, reject) => {
-    ws.once("open", resolve);
-    ws.on("error", reject);
-  });
+  const { envFile, child, ready } = await startCli();
+  await openTunnel(ready.baseUrl);
 
-  child.kill("SIGTERM");
-  const exited = await new Promise((resolve) => {
-    const timer = setTimeout(() => resolve(false), 5000);
-    child.once("exit", () => {
-      clearTimeout(timer);
-      resolve(true);
-    });
-  });
-  assert.ok(exited, "the stand-in is still running 5 s after SIGTERM");
+  assert.notEqual(
+    await stopCli(child),
+    null,
+    "the stand-in is still running 5 s after SIGTERM",
+  );
   assert.equal(
     JSON.parse(readFileSync(envFile, "utf8")).MARS_API_BASE_URL,
     undefined,
   );
+});
+
+test("survives a bad frame on a tunnel, and still puts the run back when stopped", async () => {
+  const { envFile, child, ready } = await startCli();
+  const ws = await openTunnel(ready.baseUrl);
+  const closed = new Promise((resolve) => ws.once("close", resolve));
+  // A final frame with opcode 3, which WebSocket reserves.
+  ws._socket.write(Buffer.from([0x83, 0x00]));
+
+  assert.equal(await closed, 1002);
+  assert.equal(child.exitCode, null);
+  assert.equal((await fetch(`${ready.baseUrl}/__standin/state`)).status, 200);
+  (await openTunnel(ready.baseUrl)).close();
+  assert.equal(await stopCli(child), 0);
+  assert.equal(
+    JSON.parse(readFileSync(envFile, "utf8")).MARS_API_BASE_URL,
+    undefined,
+  );
+});
+
+test("survives clients that reset as soon as they ask for a refused tunnel", async () => {
+  const { child, ready } = await startCli();
+  const { port } = new URL(ready.baseUrl);
+  const requests = [
+    ["/v2/agents/sessions/sess_ready/no-such-path", AUTH],
+    ["/v2/agents/sessions/sess_ready/port-forward/8000", {}],
+  ];
+  // Whether the reset lands before the stand-in's reply is a race; try a few.
+  for (let i = 0; i < 10 && child.exitCode === null; i += 1) {
+    const [path, headers] = requests[i % requests.length];
+    const socket = connect(Number(port), "127.0.0.1");
+    socket.on("error", () => {});
+    // An error here means the stand-in is gone; the assertion below says so.
+    await new Promise((resolve) => {
+      socket.once("connect", resolve);
+      socket.once("error", resolve);
+    });
+    socket.write(
+      [
+        `GET ${path} HTTP/1.1`,
+        "Host: standin",
+        "Connection: Upgrade",
+        "Upgrade: websocket",
+        "Sec-WebSocket-Version: 13",
+        `Sec-WebSocket-Key: ${Buffer.alloc(16).toString("base64")}`,
+        ...Object.entries(headers).map(([name, value]) => `${name}: ${value}`),
+        "",
+        "",
+      ].join("\r\n"),
+    );
+    socket.resetAndDestroy();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+
+  assert.equal(child.exitCode, null);
+  assert.equal((await fetch(`${ready.baseUrl}/__standin/state`)).status, 200);
 });
