@@ -381,7 +381,8 @@ async function guestCommand(run, launcherEnv) {
   return { command, args };
 }
 
-async function startGuest(run, dir, launcherEnv) {
+/** @param {(child: import("node:child_process").ChildProcess) => void} onSpawn */
+async function startGuest(run, dir, launcherEnv, onSpawn) {
   const home = join(dir, "guest-home");
   mkdirSync(join(home, "workspace"), { recursive: true });
   const port = await freePort();
@@ -411,6 +412,7 @@ async function startGuest(run, dir, launcherEnv) {
       stdio: ["ignore", "pipe", "pipe"],
     },
   );
+  onSpawn(child);
   child.stdout.on("data", (chunk) => appendFileSync(log, chunk));
   child.stderr.on("data", (chunk) => appendFileSync(log, chunk));
   const url = `http://127.0.0.1:${port}`;
@@ -437,23 +439,48 @@ async function main() {
   const calls = join(dir, "calls.jsonl");
   writeFileSync(calls, "", { mode: 0o600 });
 
-  const guest = options["guest-url"]
-    ? { url: options["guest-url"], child: null }
-    : await startGuest(options.run, dir, launcherEnv);
-  const { server, close } = createStandin({
-    guestUrl: guest.url,
-    wakeMs: options.wakeMs,
-    record: (entry) =>
-      appendFileSync(
-        calls,
-        `${JSON.stringify({ at: new Date().toISOString(), ...entry })}\n`,
-      ),
-  });
-  const port = await listen(server);
+  // Cleanup is in place before the guest starts: it runs in its own process
+  // group, so a Ctrl-C or the deadline during a slow first start (uvx
+  // resolving packages) would otherwise leave it running.
+  let guestChild = null;
+  let stopRunning = null;
+  let stopping = false;
+  const stop = async () => {
+    if (stopping) return;
+    stopping = true;
+    if (stopRunning) await stopRunning();
+    else await stopGroup(guestChild);
+    process.exit(0);
+  };
+  process.on("SIGTERM", stop);
+  process.on("SIGINT", stop);
+  setTimeout(stop, options.seconds * 1000).unref();
+
+  let guest, server, close, port;
+  try {
+    guest = options["guest-url"]
+      ? { url: options["guest-url"], child: null }
+      : await startGuest(options.run, dir, launcherEnv, (child) => {
+          guestChild = child;
+        });
+    ({ server, close } = createStandin({
+      guestUrl: guest.url,
+      wakeMs: options.wakeMs,
+      record: (entry) =>
+        appendFileSync(
+          calls,
+          `${JSON.stringify({ at: new Date().toISOString(), ...entry })}\n`,
+        ),
+    }));
+    port = await listen(server);
+  } catch (error) {
+    if (stopping) return; // Cancelled while starting; stop() exits.
+    await stopGroup(guestChild);
+    throw error;
+  }
   const baseUrl = `http://127.0.0.1:${port}`;
 
   const previous = launcherEnv.MARS_API_BASE_URL ?? null;
-  writePrivate(envFile, { ...launcherEnv, MARS_API_BASE_URL: baseUrl });
   const metadata = {
     pid: process.pid,
     baseUrl,
@@ -463,12 +490,8 @@ async function main() {
     previousMarsApiBaseUrl: previous,
     token: PLACEHOLDER_TOKEN,
   };
-  writePrivate(join(dir, "standin.json"), metadata);
 
-  let stopping = false;
-  const stop = async () => {
-    if (stopping) return;
-    stopping = true;
+  stopRunning = async () => {
     // Put the run back, unless someone pointed it elsewhere meanwhile.
     const env = readJson(envFile);
     if (env.MARS_API_BASE_URL === baseUrl) {
@@ -483,11 +506,9 @@ async function main() {
     });
     // Bounded, so a client that keeps a socket open cannot keep us running.
     await Promise.race([close(), sleep(1000)]);
-    process.exit(0);
   };
-  process.on("SIGTERM", stop);
-  process.on("SIGINT", stop);
-  setTimeout(stop, options.seconds * 1000).unref();
+  writePrivate(envFile, { ...launcherEnv, MARS_API_BASE_URL: baseUrl });
+  writePrivate(join(dir, "standin.json"), metadata);
   guest.child?.on("exit", stop);
 
   console.log(

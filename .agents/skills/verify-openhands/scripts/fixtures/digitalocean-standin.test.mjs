@@ -340,3 +340,63 @@ test("survives clients that reset as soon as they ask for a refused tunnel", asy
   assert.equal(child.exitCode, null);
   assert.equal((await fetch(`${ready.baseUrl}/__standin/state`)).status, 200);
 });
+
+test("stops a guest that is still starting when cancelled", async () => {
+  const run = mkdtempSync(join(tmpdir(), "oh-do-standin-"));
+  mkdirSync(join(run, "private"));
+  mkdirSync(join(run, "repo", "scripts"), { recursive: true });
+  writeFileSync(
+    join(run, "private", "launcher-env.json"),
+    JSON.stringify({ PATH: process.env.PATH }),
+  );
+  writeFileSync(
+    join(run, "run.json"),
+    JSON.stringify({ repo: join(run, "repo") }),
+  );
+  // A guest that never answers /server_info, like uvx still resolving.
+  const pidFile = join(run, "guest.pid");
+  const guest = join(run, "repo", "slow-guest.mjs");
+  writeFileSync(
+    guest,
+    `import { writeFileSync } from "node:fs";
+writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
+setInterval(() => {}, 1000);
+`,
+  );
+  writeFileSync(
+    join(run, "repo", "scripts", "dev-safe.mjs"),
+    `export const buildAgentServerCommand = () => ({
+  command: ${JSON.stringify(process.execPath)},
+  args: [${JSON.stringify(guest)}],
+});
+`,
+  );
+  const child = spawn(process.execPath, [FIXTURE, "--run", run], {
+    stdio: "ignore",
+  });
+  cleanups.push(() => child.exitCode === null && child.kill("SIGKILL"));
+  const alive = (pid) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  let pid = 0;
+  await until(() => {
+    try {
+      pid = Number(readFileSync(pidFile, "utf8"));
+    } catch {
+      // Not spawned yet.
+    }
+    return pid > 0;
+  });
+  cleanups.push(() => alive(pid) && process.kill(pid, "SIGKILL"));
+
+  const exited = new Promise((resolve) => child.once("exit", resolve));
+  child.kill("SIGINT");
+  await exited;
+
+  await until(() => !alive(pid));
+});
