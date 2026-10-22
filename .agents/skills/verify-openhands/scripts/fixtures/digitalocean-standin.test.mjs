@@ -255,10 +255,9 @@ test("points the run at itself while it runs, and puts the run back when stopped
   const { run, envFile, child, ready } = await startCli({ KEEP: "me" });
 
   assert.equal(ready.ok, true);
-  assert.equal(
-    JSON.parse(readFileSync(envFile, "utf8")).MARS_API_BASE_URL,
-    ready.baseUrl,
-  );
+  const running = JSON.parse(readFileSync(envFile, "utf8"));
+  assert.equal(running.MARS_API_BASE_URL, ready.baseUrl);
+  assert.equal(running.MARS_WEB, "1");
   const metadata = join(run, "private", "digitalocean-standin", "standin.json");
   assert.equal(statSync(metadata).mode & 0o777, 0o600);
   assert.equal((await fetch(`${ready.baseUrl}/__standin/state`)).status, 200);
@@ -266,8 +265,43 @@ test("points the run at itself while it runs, and puts the run back when stopped
   assert.equal(await stopCli(child), 0);
   const env = JSON.parse(readFileSync(envFile, "utf8"));
   assert.equal(env.MARS_API_BASE_URL, undefined);
+  assert.equal(env.MARS_WEB, undefined);
   assert.equal(env.KEEP, "me");
   assert.ok(JSON.parse(readFileSync(metadata, "utf8")).stoppedAt);
+});
+
+test("puts back the run's own MARS_API_BASE_URL and MARS_WEB when stopped", async () => {
+  const { run, envFile, child, ready } = await startCli({
+    MARS_API_BASE_URL: "https://api.example.test",
+    MARS_WEB: "0",
+  });
+
+  const running = JSON.parse(readFileSync(envFile, "utf8"));
+  assert.equal(running.MARS_API_BASE_URL, ready.baseUrl);
+  assert.equal(running.MARS_WEB, "1");
+  const metadata = join(run, "private", "digitalocean-standin", "standin.json");
+  const saved = JSON.parse(readFileSync(metadata, "utf8"));
+  assert.equal(saved.previousMarsApiBaseUrl, "https://api.example.test");
+  assert.equal(saved.previousMarsWeb, "0");
+
+  assert.equal(await stopCli(child), 0);
+  const env = JSON.parse(readFileSync(envFile, "utf8"));
+  assert.equal(env.MARS_API_BASE_URL, "https://api.example.test");
+  assert.equal(env.MARS_WEB, "0");
+});
+
+test("leaves the run alone when stopped after someone pointed it elsewhere", async () => {
+  const { envFile, child } = await startCli();
+  const elsewhere = {
+    ...JSON.parse(readFileSync(envFile, "utf8")),
+    MARS_API_BASE_URL: "https://api.example.test",
+  };
+  writeFileSync(envFile, JSON.stringify(elsewhere));
+
+  assert.equal(await stopCli(child), 0);
+  const env = JSON.parse(readFileSync(envFile, "utf8"));
+  assert.equal(env.MARS_API_BASE_URL, "https://api.example.test");
+  assert.equal(env.MARS_WEB, "1");
 });
 
 test("stops on SIGTERM while a tunnel is open", async () => {

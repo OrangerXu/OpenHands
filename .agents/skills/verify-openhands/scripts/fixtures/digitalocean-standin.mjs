@@ -9,10 +9,11 @@
  *     --run "$OH_VERIFY_RUN" [--seconds 1800] [--guest-url http://127.0.0.1:PORT]
  *
  * It points the run at itself (MARS_API_BASE_URL in the run's saved launcher
- * environment) and restores that on exit; `control-openhands restart` then
- * makes Canvas use it. Without --guest-url it starts the run's pinned
- * agent-server as the sandbox: no session key, its own OH_SECRET_KEY, a
- * private HOME. Every session tunnels to that one sandbox.
+ * environment), turns the web bridge on (MARS_WEB=1, which it needs) and
+ * restores both on exit; `control-openhands restart` then makes Canvas use it.
+ * Without --guest-url it starts the run's pinned agent-server as the sandbox:
+ * no session key, its own OH_SECRET_KEY, a private HOME. Every session
+ * tunnels to that one sandbox.
  *
  * The only token it accepts is the placeholder `dop_v1_` + 64 zeros, so a real
  * token is refused like a wrong one. It reads and records no other secret.
@@ -480,14 +481,19 @@ async function main() {
   }
   const baseUrl = `http://127.0.0.1:${port}`;
 
-  const previous = launcherEnv.MARS_API_BASE_URL ?? null;
+  // The web bridge mounts only with MARS_WEB=1.
+  const overrides = { MARS_API_BASE_URL: baseUrl, MARS_WEB: "1" };
+  const previous = Object.fromEntries(
+    Object.keys(overrides).map((name) => [name, launcherEnv[name] ?? null]),
+  );
   const metadata = {
     pid: process.pid,
     baseUrl,
     guestUrl: guest.url,
     guestPgid: guest.child?.pid ?? null,
     deadline: Math.floor(Date.now() / 1000) + options.seconds,
-    previousMarsApiBaseUrl: previous,
+    previousMarsApiBaseUrl: previous.MARS_API_BASE_URL,
+    previousMarsWeb: previous.MARS_WEB,
     token: PLACEHOLDER_TOKEN,
   };
 
@@ -495,8 +501,9 @@ async function main() {
     // Put the run back, unless someone pointed it elsewhere meanwhile.
     const env = readJson(envFile);
     if (env.MARS_API_BASE_URL === baseUrl) {
-      if (previous === null) delete env.MARS_API_BASE_URL;
-      else env.MARS_API_BASE_URL = previous;
+      for (const [name, value] of Object.entries(previous))
+        if (value === null) delete env[name];
+        else env[name] = value;
       writePrivate(envFile, env);
     }
     await stopGroup(guest.child);
@@ -507,7 +514,7 @@ async function main() {
     // Bounded, so a client that keeps a socket open cannot keep us running.
     await Promise.race([close(), sleep(1000)]);
   };
-  writePrivate(envFile, { ...launcherEnv, MARS_API_BASE_URL: baseUrl });
+  writePrivate(envFile, { ...launcherEnv, ...overrides });
   writePrivate(join(dir, "standin.json"), metadata);
   guest.child?.on("exit", stop);
 
